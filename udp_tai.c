@@ -47,6 +47,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <curses.h>
+
 
 #define ONE_SEC			1000000000ULL
 #define DEFAULT_PERIOD		1000000
@@ -281,6 +283,16 @@ static int udp_send(int fd, void *buf, int len, __u64 txtime)
 
 static unsigned char tx_buffer[256];
 
+static unsigned int num_missed_deadline = 0;
+static unsigned int num_invalid_params = 0;
+static __u64 missed_deadline_tx_timestamp[1000];
+static __u64 invalid_params_tx_timestamp[1000];
+#define NUM_TIMESTAMPS 10000
+static __u64 tx_timestamps[NUM_TIMESTAMPS] = {0};
+static __u64 sched_timestamps[NUM_TIMESTAMPS] = {0};
+static __u64 actual_timestamps[NUM_TIMESTAMPS] = {0};
+static unsigned int num_timestamps = 0;
+
 static int process_socket_error_queue(int fd)
 {
 	uint8_t msg_control[CMSG_SPACE(sizeof(struct sock_extended_err))];
@@ -313,10 +325,14 @@ static int process_socket_error_queue(int fd)
 
 			switch(serr->ee_code) {
 			case SO_EE_CODE_TXTIME_INVALID_PARAM:
-				fprintf(stderr, "packet with tstamp %llu dropped due to invalid params\n", tstamp);
+				fprintf(stderr, "*");
+				//fprintf(stderr, "packet with tstamp %llu dropped due to invalid params\n", tstamp);
+				invalid_params_tx_timestamp[num_invalid_params++] = tstamp;
 				return 0;
 			case SO_EE_CODE_TXTIME_MISSED:
-				fprintf(stderr, "packet with tstamp %llu dropped due to missed deadline\n", tstamp);
+				fprintf(stderr, "+");
+				missed_deadline_tx_timestamp[num_missed_deadline++] = tstamp;
+				//fprintf(stderr, "packet with tstamp %llu dropped due to missed deadline\n", tstamp);
 				return 0;
 				default:
 					return -1;
@@ -331,9 +347,9 @@ static int process_socket_error_queue(int fd)
 
 static int run_nanosleep(clockid_t clkid, int fd)
 {
-	struct timespec ts;
-	int cnt, err;
-	__u64 txtime;
+	struct timespec ts, actual_ts;
+	int cnt, err, i, j, k,index;
+	__u64 txtime, base_ts, invalid_param_ts, missed_deadline_ts;
 	struct pollfd p_fd = {
 		.fd = fd,
 	};
@@ -364,10 +380,20 @@ static int run_nanosleep(clockid_t clkid, int fd)
 		err = clock_nanosleep(clkid, TIMER_ABSTIME, &ts, NULL);
 		switch (err) {
 		case 0:
+			clock_gettime(clkid, &actual_ts);
 			cnt = udp_send(fd, tx_buffer, sizeof(tx_buffer), txtime);
 			if (cnt != sizeof(tx_buffer)) {
 				pr_err("udp_send failed");
 			}
+
+			tx_timestamps[num_timestamps] = txtime;
+			sched_timestamps[num_timestamps] = ts.tv_sec * ONE_SEC + ts.tv_nsec;
+			actual_timestamps[num_timestamps++] = actual_ts.tv_sec * ONE_SEC + actual_ts.tv_nsec;
+			if (num_timestamps == NUM_TIMESTAMPS)
+			{
+				num_timestamps = 0;
+			}
+
 			ts.tv_nsec += period_nsec;
 			normalize(&ts);
 			txtime += period_nsec;
@@ -379,6 +405,64 @@ static int run_nanosleep(clockid_t clkid, int fd)
 					return -ECANCELED;
 			}
 
+			if (getch() != ERR)
+			{
+				endwin();
+				printf("Missed Deadline\n");
+				for (i = 0 ; i < num_missed_deadline ; i++)
+				{
+					index = 0;
+					for (j = 0 ; j < NUM_TIMESTAMPS ; j++)
+					{
+						if (tx_timestamps[j] == missed_deadline_tx_timestamp[i])
+						{
+							index = j;
+						}
+					}
+					printf("%u,%llu,\n", index, missed_deadline_tx_timestamp[i] - base_ts);
+				}
+				printf("Invalid Params\n");
+				for (i = 0 ; i < num_invalid_params ; i++)
+				{
+					index = 0;
+					for (j = 0 ; j < NUM_TIMESTAMPS ; j++)
+					{
+						if (tx_timestamps[j] == invalid_params_tx_timestamp[i]) 
+						{
+							index = j;
+						}
+					}
+					printf("%u,%llu,\n", index, invalid_params_tx_timestamp[i] - base_ts);
+				}
+
+				base_ts = (sched_timestamps[0] / 100000000000ULL) * 100000000000ULL; 
+				printf("Sched,Actual,Transmit, %u\n", num_timestamps);
+				for (i = num_timestamps + 1 ; i < num_timestamps + 1 + NUM_TIMESTAMPS ; i++)
+				{
+					j = i % NUM_TIMESTAMPS;
+					if (sched_timestamps[j] != 0)
+					{
+						missed_deadline_ts = 0;
+						for (k = 0 ; k < num_missed_deadline ; k++)
+						{
+							if (tx_timestamps[j] == missed_deadline_tx_timestamp[k])
+							{
+								missed_deadline_ts = tx_timestamps[j];
+							}
+						}
+						invalid_param_ts = 0;
+						for (k = 0 ; k < num_invalid_params ; k++)
+						{
+							if (tx_timestamps[j] == invalid_params_tx_timestamp[k])
+							{
+								invalid_param_ts = tx_timestamps[j];
+							}
+						}
+						printf("%llu,%llu,%llu,%llu,%llu\n", sched_timestamps[j] - base_ts, actual_timestamps[j] - base_ts, tx_timestamps[j] - base_ts, missed_deadline_ts, invalid_param_ts);
+											}
+				}
+				exit(0);
+			}
 			break;
 		case EINTR:
 			continue;
@@ -462,6 +546,10 @@ int main(int argc, char *argv[])
 	int c, cpu = -1, err, fd, priority = -1;
 	clockid_t clkid = CLOCK_TAI;
 	char *iface = NULL, *progname;
+	WINDOW *w;
+
+    w = initscr();
+    nodelay(w,TRUE);
 
 	/* Process the command line arguments. */
 	progname = strrchr(argv[0], '/');
@@ -540,5 +628,6 @@ int main(int argc, char *argv[])
 	err = run_nanosleep(clkid, fd);
 
 	close(fd);
+	endwin();
 	return err;
 }
